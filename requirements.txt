@@ -3,4 +3,4 @@ pandas
 openpyxl
 xlsxwriter
 altair
-msoffice-crypto-tool
+msoffcrypto-tool
