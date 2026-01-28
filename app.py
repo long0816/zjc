@@ -2,21 +2,24 @@ import streamlit as st
 import pandas as pd
 import io
 import re
-import time
 import random
 import xlsxwriter
-import traceback
 import openpyxl
 from datetime import datetime, timedelta
 import altair as alt
 
 # 尝试导入解密库
 try:
-    import msoffice_crypto
+    import msoffcrypto as msoffice_crypto
 
     HAS_CRYPT = True
 except ImportError:
-    HAS_CRYPT = False
+    try:
+        import msoffice_crypto
+
+        HAS_CRYPT = True
+    except ImportError:
+        HAS_CRYPT = False
 
 
 # ================= 0. 样式配置 =================
@@ -42,7 +45,7 @@ def inject_custom_css():
 # ================= 1. 基础工具函数 =================
 
 def decrypt_file(file_obj, password):
-    if not HAS_CRYPT: raise ImportError("请先安装解密模块: pip install msoffice-crypto-tool")
+    if not HAS_CRYPT: raise ImportError("请安装解密模块: pip install msoffcrypto-tool")
     file_obj.seek(0)
     decrypted = io.BytesIO()
     office_file = msoffice_crypto.OfficeFile(file_obj)
@@ -53,26 +56,26 @@ def decrypt_file(file_obj, password):
 
 
 def clean_date(date_val):
-    """ 日期清洗函数 """
+    """ 增强版日期清洗函数 """
     if pd.isna(date_val): return pd.NaT
     val_str = str(date_val).strip()
-    if val_str == "" or val_str == "0" or val_str.lower() in ['nan', 'none', '-', '/']:
-        return pd.NaT
+    if val_str in ["", "0", "nan", "None", "-", "/"]: return pd.NaT
+
     if isinstance(date_val, (datetime, pd.Timestamp)):
-        if date_val.year < 2020: return pd.NaT
-        return pd.to_datetime(date_val)
+        return pd.to_datetime(date_val) if date_val.year > 2020 else pd.NaT
+
     if re.match(r'^\d+(\.\d+)?$', val_str):
         try:
             val_float = float(val_str)
-            if val_float < 43831: return pd.NaT
-            return pd.to_datetime(val_float, unit='D', origin='1899-12-30')
+            if 43831 < val_float < 58440:
+                return pd.to_datetime(val_float, unit='D', origin='1899-12-30')
         except:
             pass
+
     clean_str = val_str.replace('.', '-').replace('/', '-').replace('\\', '-')
     try:
         dt = pd.to_datetime(clean_str, errors='coerce')
-        if pd.notna(dt) and dt.year < 2020: return pd.NaT
-        return dt
+        return dt if pd.notna(dt) and dt.year > 2020 else pd.NaT
     except:
         return pd.NaT
 
@@ -99,10 +102,10 @@ def determine_cassette_info(cid):
 def find_header_row(df, search_rows=20):
     key_map = {
         'PRODUCT': ['PRODUCT ID', 'PRODUCT', 'TP NO', 'TP NUMBER', '工单', 'TP #'],
-        'LOT': ['LOT ID', 'LOT NO', 'BATCH ID', '作业工单', 'LOT #'],
-        'WAFER': ['WAFER ID', 'CHIP ID', '芯片号', '芯片'],
+        'LOT': ['LOT ID', 'LOTID', 'LOT NO', 'BATCH ID', '作业工单', 'LOT #'],
+        'WAFER': ['WAFER ID', 'WAFERID', 'CHIP ID', '芯片号', '芯片'],
         'CASSETTE': ['CASSETTE', '料盒'],
-        'DATE': ['TIME', 'DATE', '日期', '时间']
+        'DATE': ['TIME', 'DATE', '日期', '时间', '接收', '入库', '领用', '出库']
     }
     for i in range(min(len(df), search_rows)):
         row_values = [str(x).upper().strip() for x in df.iloc[i].tolist()]
@@ -119,12 +122,12 @@ def identify_system_columns(df):
     sys_cols = {}
     target_keywords = {
         '_sys_product': ['PRODUCT', 'TP NO', '工单'],
-        '_sys_lot': ['LOT ID', '作业工单', '批号'],
-        '_sys_wafer': ['WAFER', 'CHIP ID', '芯片'],
+        '_sys_lot': ['LOT ID', 'LOTID', '作业工单', '批号'],
+        '_sys_wafer': ['WAFER', 'WAFERID', 'CHIP ID', '芯片'],
         '_sys_cassette': ['CASSETTE', '料盒', 'BOX ID'],
         '_sys_location': ['LOCATION', '库位'],
-        '_sys_in_date': ['接收', '入库', 'IN_TIME'],
-        '_sys_out_date': ['领用', '出库', 'OUT_TIME'],
+        '_sys_in_date': ['接收', '入库', 'IN_TIME', '入库日期'],
+        '_sys_out_date': ['领用', '出库', 'OUT_TIME', '出入日期', '出库日期'],
         '_sys_type_raw': ['选择', 'SELECT', 'TYPE'],
         '_sys_remark': ['备注', 'REMARK']
     }
@@ -144,7 +147,7 @@ def determine_chip_type(row, file_name, sheet_name):
     if '_sys_type_raw' in row and pd.notna(row['_sys_type_raw']):
         val = str(row['_sys_type_raw']).strip().upper()
         if "REAL" in val: return "Real"
-        if "不可" in val or "NG" in val or "NON" in val: return "不可回货"
+        if any(x in val for x in ["不可", "NG", "NON"]): return "不可回货"
         if "DUMMY" in val: return "Dummy"
     f_upper = file_name.upper();
     s_upper = sheet_name.upper()
@@ -168,19 +171,13 @@ def get_client_name(file_name, sheet_name):
 
 
 def check_grey_shipped(file_obj, sheet_name, header_idx, df_len, use_grey_logic):
-    """
-    灰色行识别逻辑
-    如果 use_grey_logic=False，则直接返回全False，不浪费性能
-    """
     if not use_grey_logic: return [False] * df_len
-
     try:
         file_obj.seek(0)
         wb = openpyxl.load_workbook(file_obj, data_only=True)
         ws = wb[sheet_name]
         is_grey_list = []
         start_row = header_idx + 2
-
         curr_idx = 0
         for row in ws.iter_rows(min_row=start_row, max_row=start_row + df_len - 1):
             if curr_idx >= df_len: break
@@ -198,6 +195,8 @@ def check_grey_shipped(file_obj, sheet_name, header_idx, df_len, use_grey_logic)
     except:
         return [False] * df_len
 
+
+# ================= 2. 数据处理核心 (V8.3 修正版) =================
 
 @st.cache_data(show_spinner=False)
 def process_uploaded_files(uploaded_files, password, use_grey_logic):
@@ -243,29 +242,33 @@ def process_uploaded_files(uploaded_files, password, use_grey_logic):
             try:
                 s_upper = str(sheet_name).strip().upper()
                 f_upper = file.name.upper()
+
+                # Sheet 筛选逻辑
                 is_valid = False
                 if "在库库存" in s_upper or "出库库存" in s_upper:
                     is_valid = True
                 elif "REAL" in s_upper or "不可回货" in s_upper or "DUMMY" in f_upper:
                     if "汇总" not in s_upper and "功能" not in s_upper: is_valid = True
                 if "中间仓" in f_upper and ("汇总" not in s_upper and "功能" not in s_upper): is_valid = True
+                if "E20" in f_upper or "E20" in s_upper: is_valid = True
+
+                # 🟢 V8.3 E20 专属：严格Sheet白名单
+                if "E20" in f_upper:
+                    if sheet_name not in ["在库库存", "出库库存"]: continue
+                    is_valid = True
+
                 if not is_valid: continue
 
                 df_temp = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, nrows=20)
                 header_idx = find_header_row(df_temp)
                 df = pd.read_excel(excel_file, sheet_name=sheet_name, header=header_idx)
 
-                if "E20" in f_upper and header_idx > 0 and len(df.columns) > 0:
-                    c0 = df.columns[0]
-                    if "Unnamed" in str(c0) or "选择" in str(c0): df.rename(columns={c0: "选择"}, inplace=True)
-
-                df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
-                df = df.loc[:, ~df.columns.duplicated()]
+                if ("E20" in f_upper or "E20" in s_upper) and len(df.columns) > 0:
+                    df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
 
                 clean_fname = file.name.rsplit('.', 1)[0]
                 source_key = f"{clean_fname}-{sheet_name}"[:40]
-                original_columns = df.columns.tolist()
-                sheet_headers[source_key] = original_columns
+                sheet_headers[source_key] = df.columns.tolist()
 
                 sys_map = identify_system_columns(df)
                 if not any(k in sys_map.values() for k in ['_sys_product', '_sys_lot']): continue
@@ -276,50 +279,44 @@ def process_uploaded_files(uploaded_files, password, use_grey_logic):
                 for ns in needed_sys:
                     if ns not in df.columns: df[ns] = pd.NaT if 'date' in ns else '-'
 
-                if '_sys_remark' in df.columns:
-                    # 🟢 如果 use_grey_logic 为 False，这里直接返回全False，不消耗时间
-                    is_grey_shipped = check_grey_shipped(file_obj, sheet_name, header_idx, len(df),
-                                                         use_grey_logic=use_grey_logic)
-                    df['_sys_is_grey'] = is_grey_shipped
+                is_outbound_sheet = "出库库存" in s_upper
+                is_inbound_sheet = "在库库存" in s_upper
+
+                if is_outbound_sheet:
+                    # '出库库存'：强制视为已出库
+                    df['_sys_is_shipped'] = True
+                elif is_inbound_sheet:
+                    # '在库库存'：强制视为在库
+                    df['_sys_is_shipped'] = False
+                    df['_sys_out_date'] = pd.NaT
                 else:
-                    df['_sys_is_grey'] = False
+                    # 常规逻辑
+                    if '_sys_remark' in df.columns:
+                        is_grey_shipped = check_grey_shipped(file_obj, sheet_name, header_idx, len(df),
+                                                             use_grey_logic=use_grey_logic)
+                        df['_sys_is_grey'] = is_grey_shipped
+                    else:
+                        df['_sys_is_grey'] = False
 
-                # 🟢🟢🟢 V7.0 核心修正 🟢🟢🟢
-                # 1. 保留原始数据
-                df['_sys_out_date_raw'] = df['_sys_out_date']
+                    df['_sys_out_date_raw'] = df['_sys_out_date']
+                    df['_sys_out_date'] = df['_sys_out_date'].apply(clean_date)
+                    mask_has_content = df['_sys_out_date_raw'].apply(
+                        lambda x: pd.notna(x) and str(x).strip() not in ['', '0', 'nan', 'None', '-'])
+                    keywords = ['蓝膜', 'blue tape']
+                    df['_sys_remark'] = df['_sys_remark'].astype(str)
+                    mask_keyword = df['_sys_remark'].str.contains('|'.join(keywords), na=False, case=False)
+                    mask_grey = df['_sys_is_grey']
+                    df['_sys_is_shipped'] = (
+                                pd.notna(df['_sys_out_date']) | mask_has_content | mask_keyword | mask_grey)
 
-                # 2. 清洗日期 (用于统计)
-                df['_sys_out_date'] = df['_sys_out_date'].apply(clean_date)
-
-                # 3. 判定 A: 领用列有内容 -> 出库 (最高优先级)
-                mask_has_content = df['_sys_out_date_raw'].apply(
-                    lambda x: pd.notna(x) and str(x).strip() not in ['', '0', 'nan', 'None', '-'])
-
-                # 4. 判定 B: 备注里有"蓝膜" -> 出库
-                keywords = ['蓝膜', 'blue tape']
-                df['_sys_remark'] = df['_sys_remark'].astype(str)
-                mask_keyword = df['_sys_remark'].str.contains('|'.join(keywords), na=False, case=False)
-
-                # 5. 判定 C: 灰色背景 (仅当侧边栏开启时生效，默认不看)
-                mask_grey = df['_sys_is_grey']
-
-                # 6. 综合判定 (任一满足即出库)
-                mask_force_out = (
-                        (mask_has_content & pd.isna(df['_sys_out_date'])) |  # 领用列有字 (即使解析失败)
-                        (mask_keyword & pd.isna(df['_sys_out_date'])) |  # 备注有蓝膜
-                        (mask_grey & pd.isna(df['_sys_out_date']))  # 灰色 (仅在开启时为True)
-                )
-
-                # 7. 赋予当前时间作为标记
-                df.loc[mask_force_out, '_sys_out_date'] = pd.Timestamp.now()
-                # 🟢🟢🟢 修改结束 🟢🟢🟢
+                df['_sys_in_date'] = df['_sys_in_date'].apply(clean_date)
+                if is_outbound_sheet:
+                    df['_sys_out_date'] = df['_sys_out_date'].apply(clean_date)
 
                 df['_sys_diff_lot'] = df['_sys_wafer'].apply(extract_diffusion_lot)
-                df['_sys_in_date'] = df['_sys_in_date'].apply(clean_date)
                 df['_sys_client'] = get_client_name(file.name, sheet_name)
                 df['_sys_chip_type'] = df.apply(lambda row: determine_chip_type(row, file.name, sheet_name), axis=1)
                 df['_sys_cass_type'], df['_sys_cass_prefix'] = zip(*df['_sys_cassette'].apply(determine_cassette_info))
-
                 df['_sys_source_key'] = source_key
                 all_data.append(df)
             except:
@@ -342,9 +339,11 @@ def calculate_statistics(df, start_date, end_date):
     for client, group in df.groupby('_sys_client'):
         in_this = group[(group['_sys_in_date'] >= t_start) & (group['_sys_in_date'] <= t_end)]
         in_last = group[(group['_sys_in_date'] >= l_start) & (group['_sys_in_date'] <= l_end)]
+
         out_this = group[(group['_sys_out_date'] >= t_start) & (group['_sys_out_date'] <= t_end)]
         out_last = group[(group['_sys_out_date'] >= l_start) & (group['_sys_out_date'] <= l_end)]
-        stock_curr = group[pd.isna(group['_sys_out_date'])]
+
+        stock_curr = group[group['_sys_is_shipped'] == False]
 
         def calc_growth(curr, last):
             if last == 0: return 0 if curr == 0 else 1.0
@@ -605,7 +604,7 @@ def create_workbook_base():
 
 # ================= 6. 界面逻辑 =================
 
-st.set_page_config(page_title="智能芯片台账 ProMax", layout="wide", page_icon="🐱")
+st.set_page_config(page_title="智能芯片台账 V8.3", layout="wide", page_icon="🐱")
 inject_custom_css()
 st.title("🐱 智能芯片台账系统 (Ultimate)")
 
@@ -626,7 +625,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("#### ⚙️ 高级设置")
-    # 🟢 默认关闭灰色识别，响应“不看灰色背景”
     use_grey_logic = st.checkbox("启用灰色背景识别 (针对919等台账)", value=False,
                                  help="默认不看灰色背景。\n如果您的台账（如919）依赖灰色来表示出库，请勾选此项。")
     if use_grey_logic:
@@ -638,27 +636,26 @@ with st.sidebar:
     uploaded_files = st.file_uploader("上传 Excel 文件", accept_multiple_files=True, type=['xlsx', 'xls', 'xlsm'])
 
 if uploaded_files:
-    # 🟢 传入 use_grey_logic 参数
     df, headers_map = process_uploaded_files(uploaded_files, password, use_grey_logic)
     if not df.empty:
         st.session_state.data_loaded = True
         st.session_state.df_master = df
         st.session_state.sheet_headers = headers_map
 
-        df_stock = df[pd.isna(df['_sys_out_date'])].copy()  # 仅在库
+        # 🟢 在库筛选：使用新的 _sys_is_shipped 标志
+        df_stock = df[df['_sys_is_shipped'] == False].copy()
         if not df_stock.empty:
             st.session_state.stock_pivot = df_stock.pivot_table(index='_sys_client', columns='_sys_chip_type',
                                                                 values='_sys_wafer', aggfunc='count', fill_value=0)
             st.session_state.chart_data = df_stock.groupby(['_sys_client', '_sys_chip_type']).size().reset_index(
                 name='Count')
-            # 🟢 盘点清单逻辑
             stocktake = df_stock.groupby(['_sys_client', '_sys_location', '_sys_cassette']).agg(
                 账面片数=('_sys_wafer', 'count')
             ).reset_index()
             stocktake.columns = ['客户', '库位', '料盒号', '账面片数']
             st.session_state.df_stocktake = stocktake
 
-        df_c = df[(~df['_sys_cassette'].isin(['-', 'nan', '', '未知/空'])) & (pd.isna(df['_sys_out_date']))]
+        df_c = df[(~df['_sys_cassette'].isin(['-', 'nan', '', '未知/空'])) & (df['_sys_is_shipped'] == False)]
         if not df_c.empty:
             st.session_state.cassette_details = df_c.groupby(
                 ['_sys_client', '_sys_cass_type', '_sys_cass_prefix', '_sys_cassette']).agg(
@@ -684,7 +681,6 @@ with tab1:
                                    "库存.xlsx")
         with c2:
             if not st.session_state.chart_data.empty:
-                # 🟢 优化颜色
                 chart = alt.Chart(st.session_state.chart_data).mark_bar().encode(
                     x=alt.X('_sys_client', title='客户'),
                     y=alt.Y('Count', title='在库数量'),
@@ -714,9 +710,9 @@ with tab2:
                 res = st.session_state.df_master.copy()
                 if sel_client: res = res[res['_sys_client'].isin(sel_client)]
                 if sel_status == "在库":
-                    res = res[pd.isna(res['_sys_out_date'])]
+                    res = res[res['_sys_is_shipped'] == False]
                 elif sel_status == "已出库":
-                    res = res[pd.notna(res['_sys_out_date'])]
+                    res = res[res['_sys_is_shipped'] == True]
 
                 if q_diff: res = res[res['_sys_diff_lot'].str.contains(q_diff, na=False, case=False)]
                 if q_wafer: res = res[res['_sys_wafer'].str.contains(q_wafer, na=False, case=False)]
